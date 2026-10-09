@@ -7,7 +7,11 @@
 #   bash <(curl -fsSL https://raw.githubusercontent.com/xevorhq-rgb/mac-herstel/main/herstel.sh)
 #
 # Het script vraagt om 3 waarden uit de RAMP-KAART in je wachtwoordmanager:
-#   1. R2 Access Key ID          2. R2 Secret Access Key          3. Backup-wachtwoord
+#   1. R2 Access Key ID          2. R2 Secret Access Key
+#   3. Restic-wachtwoord (route r, standaard sinds 09-10-2026) of Backup-wachtwoord (route b)
+# Twee routes:
+#   r = restic (incrementele back-up onder R2-prefix restic-macmini, elke nacht 04:30) — STANDAARD
+#   b = oude totaalbundel (openssl-tar onder macmini-backup, 03:45) — terugval, zolang die nog draait
 #
 # Dit bestand bevat GEEN geheimen en mag publiek staan.
 # ============================================================================
@@ -30,7 +34,14 @@ kop "Xevor Mac Mini herstel"
 echo "  Pak de RAMP-KAART uit je wachtwoordmanager erbij."
 read -r -p "  R2 Access Key ID: " R2_ACCESS_KEY_ID < /dev/tty
 read -r -s -p "  R2 Secret Access Key: " R2_SECRET_ACCESS_KEY < /dev/tty; echo
-read -r -s -p "  Backup-wachtwoord: " BACKUP_WW < /dev/tty; echo
+read -r -p "  Route: [r]estic (standaard) of [b]undel (oud): " HERSTEL_ROUTE < /dev/tty
+HERSTEL_ROUTE="${HERSTEL_ROUTE:-r}"
+if [[ "$HERSTEL_ROUTE" == "b" ]]; then
+  read -r -s -p "  Backup-wachtwoord: " BACKUP_WW < /dev/tty; echo
+else
+  HERSTEL_ROUTE="r"
+  read -r -s -p "  Restic-wachtwoord: " BACKUP_WW < /dev/tty; echo
+fi
 export R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY BACKUP_WW
 [[ -n "$R2_ACCESS_KEY_ID" && -n "$R2_SECRET_ACCESS_KEY" && -n "$BACKUP_WW" ]] || fout "lege invoer"
 
@@ -66,6 +77,26 @@ for gereedschap in python3 git gh node npm; do
 done
 ok "geïnstalleerd en gecontroleerd"
 
+if [[ "$HERSTEL_ROUTE" == "r" ]]; then
+# --- 4+5 (restic). Haalt de nieuwste snapshot rechtstreeks van R2; geen bundel-download. ---
+kop "4/9 restic installeren"
+brew install -q restic >/dev/null 2>&1 || true
+command -v restic >/dev/null 2>&1 || fout "restic ontbreekt na brew install"
+ok "restic $(restic version | awk '{print $2}')"
+kop "5/9 Nieuwste snapshot terugzetten uit R2 (restic)"
+export AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID" AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY" AWS_DEFAULT_REGION=auto
+export RESTIC_REPOSITORY="s3:$R2_ENDPOINT/$R2_BUCKET/restic-macmini" RESTIC_PASSWORD="$BACKUP_WW"
+restic snapshots --host xevor-macmini --latest 3 || fout "repo niet leesbaar (kloppen de R2-sleutels en het restic-wachtwoord?)"
+RESTIC_DOEL="$HOME/herstel-restic"
+restic restore latest --host xevor-macmini --target "$RESTIC_DOEL" || fout "restic restore faalde"
+# restic zet absolute paden terug (bv. herstel-restic/Users/xevor/...): zoek de oude home-map
+EXTRA_DIR=$(find "$RESTIC_DOEL" -maxdepth 4 -type d -name .restic-extra | head -1)
+[[ -n "$EXTRA_DIR" ]] || fout "snapshot incompleet (.restic-extra mist)"
+STAGING="$(dirname "$EXTRA_DIR")"
+cp -R "$EXTRA_DIR/." "$STAGING/"      # Brewfile, repos.txt, LaunchAgents, gh-token, crontab
+[[ -f "$STAGING/.openclaw/workspace/SOUL_CORE.md" ]] || fout "snapshot incompleet (sentinel mist)"
+ok "teruggezet in $STAGING"
+else
 # --- 4. Nieuwste backup-bundel ophalen van R2 ---
 kop "4/9 Backup-bundel downloaden van R2"
 VENV="$(mktemp -d)/venv"
@@ -104,11 +135,13 @@ mkdir -p "$STAGING"
   || fout "ontsleutelen faalde (klopt het backup-wachtwoord?)"
 [[ -f "$STAGING/.openclaw/workspace/SOUL_CORE.md" ]] || fout "bundel incompleet (sentinel mist)"
 ok "uitgepakt in $STAGING"
+fi
 
 # --- 6. Bestanden terugzetten (Projects komt uit de bundel, mét niet-gecommit werk) ---
 kop "6/9 Bestanden terugzetten"
 for item in .openclaw .claude vault Projects .ssh .gitconfig .zshrc .zprofile \
-            .claude.json raad-van-advies.md sync-soul.sh SignaalRadar .config; do
+            .claude.json raad-van-advies.md sync-soul.sh SignaalRadar .config \
+            WoningArchief Archief backups; do
   if [[ -e "$STAGING/$item" ]]; then
     if [[ "$item" == ".config" ]]; then
       mkdir -p "$HOME/.config" && cp -R "$STAGING/.config/." "$HOME/.config/"
@@ -194,7 +227,7 @@ cat <<'CHECKLIST'
   □ Energiestand: Systeeminstellingen → nooit sluimeren (headless!)
   □ Test: launchctl list | grep -E "xevor|gerustgekocht"   (alles moet er staan)
   □ Test: claude → vraag "wie ben ik en waar waren we mee bezig?"
-  □ Ruim op: rm -rf ~/herstel-uitgepakt ~/herstel-bundel.tar.gz.enc ~/*.pre-herstel
+  □ Ruim op: rm -rf ~/herstel-uitgepakt ~/herstel-restic ~/herstel-bundel.tar.gz.enc ~/*.pre-herstel
 CHECKLIST
 echo
 if (( WARN_AANTAL > 0 )); then
